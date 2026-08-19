@@ -1,0 +1,95 @@
+trigger: none
+pr: none
+
+resources:
+- repo: self
+
+pool:
+  name: demo
+  demands:
+  - agent.name -equals demo
+
+stages:
+- stage: Build
+  displayName: Build
+  jobs:
+  - job: Build
+    displayName: Build
+    workspace:
+      clean:
+    steps:
+    - task: SonarQubePrepare@7
+      inputs:
+        SonarQube: 'SonarQube'
+        scannerMode: 'Other'
+        extraProperties: |
+          # Additional properties that will be passed to the scanner, 
+          # Put one key=value per line, example:
+          # sonar.exclusions=**/*.bin
+          sonar.projectName=maven-project
+          sonar.projectKey=maven-project
+          sonar.qualitygate.wait=true
+          sonar.qualitygate.timeout=300
+    - task: Bash@3
+      displayName: 'Remove sonar.branch.name for Community Edition'
+      inputs:
+        targetType: 'inline'
+        script: |
+          if [ -n "$SONARQUBE_SCANNER_PARAMS" ]; then
+            NEW_PARAMS=$(python3 -c '
+          import os, json
+          params = json.loads(os.environ["SONARQUBE_SCANNER_PARAMS"])
+          if "sonar.branch.name" in params:
+              del params["sonar.branch.name"]
+          print(json.dumps(params))
+            ')
+            echo "##vso[task.setvariable variable=SONARQUBE_SCANNER_PARAMS]$NEW_PARAMS"
+            echo "Successfully removed sonar.branch.name from scanner parameters."
+          fi
+    - task: SonarQubePublish@7
+      inputs:
+        pollingTimeoutSec: '300'
+    - task: MavenAuthenticate@0
+      inputs:
+        artifactsFeeds: 'Maven-Feed'
+        mavenServiceConnections: 'Maven'
+    - task: Maven@4
+      inputs:
+        azureSubscription: 'Azure DevOps Service Connection'
+        mavenPomFile: 'pom.xml'
+        goals: 'clean deploy org.sonarsource.scanner.maven:sonar-maven-plugin:5.7.0.6970:sonar'
+        publishJUnitResults: false
+        javaHomeOption: 'JDKVersion'
+        mavenVersionOption: 'Default'
+        mavenAuthenticateFeed: true
+        effectivePomSkip: false
+        sonarQubeRunAnalysis: false
+- stage: Deployment
+  displayName: Deployment
+  dependsOn: Build
+  jobs:
+  - deployment: Deployment
+    displayName: Deployment
+    environment: 'dev'
+    strategy:
+     runOnce:
+       deploy:
+         steps:
+         - checkout: none  
+         - task: CmdLine@2
+           inputs:
+             script: |
+               echo "IMAGE_VERSION=$IMAGE_VERSION"
+               packer plugins install github.com/hashicorp/azure
+               packer plugins install github.com/hashicorp/ansible
+               DEXTER=`packer build -var image_version=$(IMAGE_VERSION) -var "tenant_id=$(TENANT_ID)" -var "subscription_id=$(SUBSCRIPTION_ID)" -var "client_id=$(CLIENT_ID)" -var "client_secret=$(CLIENT_SECRET)" template.json | tail -7 | head -1`
+               image_name=`echo $DEXTER|cut -d ":" -f2`
+               echo $image_name
+               az vmss update --resource-group vmss-resource-group --name mytestscaleset-1 --set virtualMachineProfile.storageProfile.imageReference.id="${image_name//[[:blank:]]/}"
+               az vmss update-instances --instance-ids '*' --resource-group vmss-resource-group --name mytestscaleset-1 --no-wait
+           env:
+             TENANT_ID: $(TENANT_ID)
+             SUBSCRIPTION_ID: $(SUBSCRIPTION_ID)
+             CLIENT_ID: $(CLIENT_ID)
+             CLIENT_SECRET: $(CLIENT_SECRET)
+             IMAGE_VERSION: $(IMAGE_VERSION) 
